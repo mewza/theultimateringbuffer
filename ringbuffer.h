@@ -1,5 +1,5 @@
 /*
- *   The Ultimate Ring Buffer - It only took 25 years to write it.
+ *   The Ultimate Ring Buffer v1.1 - It only took 25 years to write it.
  *   �1999-2025 SUBBAND, Inc. & Dmitry Boldyrev
  *   
  *   Description:    Ring Buffer with std::atomic Synchronization
@@ -22,71 +22,49 @@
 } while (0)
 #endif
 
-class RingBuffer
-{
+/*
+    The Ultimate Ring Buffer - It only took 25 years to write it.
+    �1999-2025 SUBBAND, Inc. & Dmitry Boldyrev
+    
+    Description:    Ring Buffer with std::atomic Synchronization
+    Updated:        Aug 3, 2025
+*/
+
+#pragma once
+
+#include <algorithm>
+#include <cstring>
+#include <atomic>
+#include <chrono>
+
+// #define DEBUG_RING
+
+#ifdef DEBUG_RING
+#define RING_LOG(fmt, ...) do { \
+    LOG(fmt, ##__VA_ARGS__); \
+} while (0)
+#else
+#define RING_LOG(fmt, ...) do { \
+} while (0)
+#endif
+
+class RingBuffer {
 private:
-    struct BufferSnapshot {
-        int bufSize;
-        int freeSpace;
-        int saveFreeSpace;
-        int saveReadPos;
-        int readPos;
-        int writePos;
-        
-        inline bool InSaveMode() const { return saveFreeSpace != -1; }
-        inline int EffectiveFreeSpace() const { return InSaveMode() ? saveFreeSpace : freeSpace; }
-        inline int UsedSpace() const { return bufSize - EffectiveFreeSpace(); }
-    };
+    std::atomic<int> mReadPos{0};
+    std::atomic<int> mWritePos{0};
+    int mBufSize{0};
+    std::unique_ptr<uint8_t[]> mBuffer;
     
-    std::atomic<int>            mFreeSpace{0};
-    std::atomic<int>            mReadPos{0};
-    std::atomic<int>            mWritePos{0};
-    std::atomic<int>            mSaveFreeSpace{-1};
-    std::atomic<int>            mSaveReadPos{-1};
-    std::atomic<int>            mBufSize{0};
-   
-    mutable int                 mSaveReadCallCount{0};
-    mutable int                 mRestoreReadCallCount{0};
+    // Save/restore state (used by reader thread only for peek operations)
+    int mSaveReadPos{-1};
     
-    std::unique_ptr<uint8_t[]>  mBuffer;
-    inline BufferSnapshot GetAtomicSnapshot() const {
-        std::atomic_thread_fence(std::memory_order_acquire);
-        
-        BufferSnapshot snapshot;
-        snapshot.bufSize = mBufSize.load(std::memory_order_acquire);
-        snapshot.freeSpace = mFreeSpace.load(std::memory_order_acquire);
-        snapshot.readPos = mReadPos.load(std::memory_order_acquire);
-        snapshot.writePos = mWritePos.load(std::memory_order_acquire);
-        snapshot.saveFreeSpace = mSaveFreeSpace.load(std::memory_order_acquire);
-        snapshot.saveReadPos = mSaveReadPos.load(std::memory_order_acquire);
-    
-        return snapshot;
-    }
-    
-    inline void UpdateAtomicState(const BufferSnapshot &snapshot) {
-        std::atomic_thread_fence(std::memory_order_acq_rel);
-        
-        // Store with detailed logging
-        mFreeSpace.store(snapshot.freeSpace, std::memory_order_release);
-        mReadPos.store(snapshot.readPos, std::memory_order_release);
-        mWritePos.store(snapshot.writePos, std::memory_order_release);
-        mSaveFreeSpace.store(snapshot.saveFreeSpace, std::memory_order_release);
-        mSaveReadPos.store(snapshot.saveReadPos, std::memory_order_release);
-        
-        std::atomic_thread_fence(std::memory_order_release);
-        
-        // Read back immediately to confirm
-        int verifyFreeSpace = mFreeSpace.load(std::memory_order_acquire);
-        int verifyReadPos = mReadPos.load(std::memory_order_acquire);
-        int verifyWritePos = mWritePos.load(std::memory_order_acquire);
-    }
+    // Debug counters
+    mutable int mSaveReadCallCount{0};
+    mutable int mRestoreReadCallCount{0};
     
 public:
-    
-    explicit RingBuffer(int size = 1024)
-    {
+    explicit RingBuffer(int size = 1024) {
         if (Init(size) < 0) {
-            RING_LOG("Failed to initialize buffer");
             throw std::runtime_error("Buffer initialization failed");
         }
     }
@@ -94,323 +72,361 @@ public:
     inline int Init(int inSize) {
         try {
             mBuffer = std::unique_ptr<uint8_t[]>(new uint8_t[inSize]);
-            mBufSize.store(inSize, std::memory_order_release);
+            mBufSize = inSize;
             Empty();
             return 0;
         } catch (const std::bad_alloc&) {
-            RING_LOG("Memory allocation failed");
+            RING_LOG("Memory allocation failed for size %d", inSize);
             return -1;
         }
-    }
-    
-    inline int FreeSpace(bool inAfterMarker = true) const {
-        const BufferSnapshot snapshot = GetAtomicSnapshot();
-        return snapshot.freeSpace;
-    }
-    
-    inline int UsedSpace(bool inAfterMarker = true) const {
-        const BufferSnapshot snapshot = GetAtomicSnapshot();
-        int result = snapshot.bufSize - snapshot.freeSpace;
-        return result;
-    }
-       
-    
-    inline int ReadData(void *_Nullable data, int bytes) {
-        BufferSnapshot snapshot = GetAtomicSnapshot();
-        
-        int usedSpace = snapshot.UsedSpace();
-        if ((bytes = std::min(usedSpace, bytes)) == 0)
-            return 0;
-    
-        int endRead = (snapshot.readPos + bytes) % snapshot.bufSize;
-        
-        if (data) {
-            if (endRead > snapshot.readPos) {
-                std::memcpy(data, &mBuffer[snapshot.readPos], bytes);
-            } else {
-                int firstPartSize = snapshot.bufSize - snapshot.readPos;
-                if (firstPartSize > 0 && firstPartSize <= bytes) {
-                    std::memcpy(data, &mBuffer[snapshot.readPos], firstPartSize);
-                    if (endRead > 0) {
-                        std::memcpy(static_cast<uint8_t*>(data) + firstPartSize, &mBuffer[0], endRead);
-                    }
-                } else {
-                    int safeSize = std::min(bytes, firstPartSize);
-                    std::memcpy(data, &mBuffer[snapshot.readPos], safeSize);
-                }
-            }
-        }
-        
-        snapshot.readPos = endRead;
-        snapshot.freeSpace += bytes;
-        
-        UpdateAtomicState(snapshot);
-        
-        return bytes;
-    }
-    
-    inline int WriteData(const void*_Nullable data, int bytes) {
-        BufferSnapshot snapshot = GetAtomicSnapshot();
-       
-        int freeSpace = snapshot.EffectiveFreeSpace();
-        if ((bytes = std::min(freeSpace, bytes)) == 0) {
-            RING_LOG("WriteData: EXIT - no space available (freeSpace=%d)", freeSpace);
-            return 0;
-        }
-        
-        int endWrite = (snapshot.writePos + bytes) % snapshot.bufSize;
-        if (data) {
-            if (endWrite > snapshot.writePos) {
-                std::memcpy(&mBuffer[snapshot.writePos], data, bytes);
-            } else {
-                int firstPartSize = snapshot.bufSize - snapshot.writePos;
-                std::memcpy(&mBuffer[snapshot.writePos], data, firstPartSize);
-                std::memcpy(&mBuffer[0], static_cast<const uint8_t*>(data) + firstPartSize, endWrite);
-            }
-        }
-        
-        snapshot.writePos = endWrite;
-        snapshot.freeSpace -= bytes;
-        
-        UpdateAtomicState(snapshot);
-        
-        return bytes;
     }
     
     inline int BufSize() const {
-        return mBufSize.load(std::memory_order_acquire);
-    }
-    
-    inline bool IsReadMode() const {
-        return mSaveFreeSpace.load(std::memory_order_acquire) == -1;
+        return mBufSize;
     }
     
     inline void Empty() {
-        BufferSnapshot snapshot = GetAtomicSnapshot();
+        mReadPos.store(0, std::memory_order_relaxed);
+        mWritePos.store(0, std::memory_order_relaxed);
+        mSaveReadPos = -1;
         
-        snapshot.readPos = 0;
-        snapshot.writePos = 0;
-        snapshot.freeSpace = snapshot.bufSize;
-        snapshot.saveFreeSpace = -1;
-        snapshot.saveReadPos = -1;
+        // Memory fence to ensure visibility
+        std::atomic_thread_fence(std::memory_order_release);
         
-        UpdateAtomicState(snapshot);
+        RING_LOG("Buffer emptied");
     }
+    
+    // ===== SPACE CALCULATIONS =====
+    
+    inline int FreeSpace(bool inAfterMarker = true) const {
+        int currentRead = mReadPos.load(std::memory_order_acquire);
+        int currentWrite = mWritePos.load(std::memory_order_acquire);
+        
+        // Free space = total - used - 1 (keep one slot empty to distinguish full/empty)
+        int used = (currentWrite - currentRead + mBufSize) % mBufSize;
+        return mBufSize - used - 1;
+    }
+    
+    inline int UsedSpace(bool inAfterMarker = true) const {
+        int currentRead = mReadPos.load(std::memory_order_acquire);
+        int currentWrite = mWritePos.load(std::memory_order_acquire);
+        
+        return (currentWrite - currentRead + mBufSize) % mBufSize;
+    }
+    
+    // ===== CORE READ/WRITE OPERATIONS =====
+    
+    inline int WriteData(const void* _Nullable data, int bytes) {
+        if (bytes <= 0) return 0;
+        
+        int currentRead = mReadPos.load(std::memory_order_acquire);
+        int currentWrite = mWritePos.load(std::memory_order_relaxed);
+        
+        // Calculate available space (keep 1 slot empty)
+        int available = (currentRead - currentWrite - 1 + mBufSize) % mBufSize;
+        bytes = std::min(bytes, available);
+        
+        if (bytes > 0 && data) {
+            int endWrite = (currentWrite + bytes) % mBufSize;
+            
+            if (endWrite > currentWrite) {
+                // No wraparound
+                std::memcpy(&mBuffer[currentWrite], data, bytes);
+            } else {
+                // Handle wraparound
+                int firstPart = mBufSize - currentWrite;
+                std::memcpy(&mBuffer[currentWrite], data, firstPart);
+                std::memcpy(&mBuffer[0], static_cast<const uint8_t*>(data) + firstPart, bytes - firstPart);
+            }
+            
+            // Update write position with release semantics
+            mWritePos.store(endWrite, std::memory_order_release);
+            
+            RING_LOG("WriteData: wrote %d bytes, writePos %d->%d", bytes, currentWrite, endWrite);
+        }
+        
+        return bytes;
+    }
+    
+    inline int ReadData(void* _Nullable data, int bytes) {
+        if (bytes <= 0) return 0;
+        
+        int currentWrite = mWritePos.load(std::memory_order_acquire);
+        int currentRead = mReadPos.load(std::memory_order_relaxed);
+        
+        // Calculate available data
+        int available = (currentWrite - currentRead + mBufSize) % mBufSize;
+        bytes = std::min(bytes, available);
+        
+        if (bytes > 0) {
+            int endRead = (currentRead + bytes) % mBufSize;
+            
+            if (data) {
+                if (endRead > currentRead) {
+                    // No wraparound
+                    std::memcpy(data, &mBuffer[currentRead], bytes);
+                } else {
+                    // Handle wraparound
+                    int firstPart = mBufSize - currentRead;
+                    std::memcpy(data, &mBuffer[currentRead], firstPart);
+                    std::memcpy(static_cast<uint8_t*>(data) + firstPart, &mBuffer[0], bytes - firstPart);
+                }
+            }
+            
+            // Update read position with release semantics
+            mReadPos.store(endRead, std::memory_order_release);
+            
+            RING_LOG("ReadData: read %d bytes, readPos %d->%d", bytes, currentRead, endRead);
+        }
+        
+        return bytes;
+    }
+    
+    // ===== PEEK OPERATIONS =====
+    
+    inline int PeekData(void* dst, int bytes) const {
+        if (!dst || bytes <= 0) return -1;
+        
+        int currentWrite = mWritePos.load(std::memory_order_acquire);
+        int currentRead = mReadPos.load(std::memory_order_acquire);
+        
+        int available = (currentWrite - currentRead + mBufSize) % mBufSize;
+        if (available < bytes) {
+            return -1; // Not enough data
+        }
+        
+        if (currentRead < 0 || currentRead >= mBufSize) {
+            return -1; // Invalid read position
+        }
+        
+        int endRead = (currentRead + bytes) % mBufSize;
+        
+        if (endRead > currentRead) {
+            // No wraparound
+            std::memcpy(dst, &mBuffer[currentRead], bytes);
+        } else {
+            // Handle wraparound
+            int firstPart = mBufSize - currentRead;
+            std::memcpy(dst, &mBuffer[currentRead], firstPart);
+            std::memcpy(static_cast<uint8_t*>(dst) + firstPart, &mBuffer[0], bytes - firstPart);
+        }
+        
+        return bytes;
+    }
+    
+    // ===== SAVE/RESTORE FOR PEEK MODE =====
     
     inline void SaveRead() {
         mSaveReadCallCount++;
+        mSaveReadPos = mReadPos.load(std::memory_order_acquire);
         
-        BufferSnapshot snapshot = GetAtomicSnapshot();
-        snapshot.saveReadPos = snapshot.readPos;
-        snapshot.saveFreeSpace = snapshot.freeSpace;
-        UpdateAtomicState(snapshot);
+        RING_LOG("SaveRead: saved position %d (call #%d)", mSaveReadPos, mSaveReadCallCount);
     }
     
-    inline void RestoreRead() {
-        BufferSnapshot snapshot = GetAtomicSnapshot();
-        
-        if (snapshot.saveFreeSpace == -1) {
-            RING_LOG("RestoreRead called but no save state exists!");
-            return;
-        }
-        
+    inline int RestoreRead() {
         mRestoreReadCallCount++;
-      
-        int savedWritePos = snapshot.writePos; // Current writePos
-        int bytesWrittenSinceSave = (savedWritePos - snapshot.saveReadPos + snapshot.bufSize) % snapshot.bufSize;
         
-        if (bytesWrittenSinceSave > 0) {
-            // Adjust the saved freeSpace to account for data written since save
-            int adjustedSaveFreeSpace = snapshot.saveFreeSpace - bytesWrittenSinceSave;
-            if (adjustedSaveFreeSpace < 0) adjustedSaveFreeSpace = 0;
-            
-            snapshot.readPos = snapshot.saveReadPos;
-            snapshot.freeSpace = adjustedSaveFreeSpace;
-        } else {
-            // No data written since save - normal restore
-            snapshot.readPos = snapshot.saveReadPos;
-            snapshot.freeSpace = snapshot.saveFreeSpace;
+        if (mSaveReadPos == -1) {
+            RING_LOG("RestoreRead: no save state exists (call #%d)", mRestoreReadCallCount);
+            return -1;
         }
+        
+        int oldPos = mReadPos.load(std::memory_order_relaxed);
+        mReadPos.store(mSaveReadPos, std::memory_order_release);
+        
+        RING_LOG("RestoreRead: restored %d->%d (call #%d)", oldPos, mSaveReadPos, mRestoreReadCallCount);
         
         // Clear save state
-        snapshot.saveFreeSpace = -1;
-        snapshot.saveReadPos = -1;
-        
-        UpdateAtomicState(snapshot);
-        
-        // Verify the restore didn't create inconsistent state
-        BufferSnapshot verifySnapshot = GetAtomicSnapshot();
-        int usedSpace = verifySnapshot.bufSize - verifySnapshot.freeSpace;
-        int expectedUsed = (verifySnapshot.writePos - verifySnapshot.readPos + verifySnapshot.bufSize) % verifySnapshot.bufSize;
-        
-        if (std::abs(usedSpace - expectedUsed) > 1) {  // Allow 1 byte tolerance
-            RING_LOG("RestoreRead created inconsistent state!");
-            RING_LOG("   Calculated used: %d, Expected used: %d", usedSpace, expectedUsed);
-            RING_LOG("   readPos: %d, writePos: %d, freeSpace: %d",
-                     verifySnapshot.readPos, verifySnapshot.writePos, verifySnapshot.freeSpace);
-        }
+        mSaveReadPos = -1;
+        return 0;
     }
     
     inline void ClearSaveState() {
-        BufferSnapshot snapshot = GetAtomicSnapshot();
-        
-        if (snapshot.saveFreeSpace != -1) {
-            snapshot.saveFreeSpace = -1;
-            snapshot.saveReadPos = -1;
-            UpdateAtomicState(snapshot);
+        if (mSaveReadPos != -1) {
+            RING_LOG("ClearSaveState: clearing saved position %d", mSaveReadPos);
+            mSaveReadPos = -1;
         }
     }
-    inline int PeekData(void* dst, int bytes) const {
-        const BufferSnapshot snapshot = GetAtomicSnapshot();
+    
+    inline bool IsReadMode() const {
+        return mSaveReadPos == -1;
+    }
+    
+    // ===== POSITIONING OPERATIONS =====
+    
+    inline int SkipData(int bytes) {
+        if (bytes <= 0) return 0;
         
-        int usedSpace = snapshot.UsedSpace();
-        if (usedSpace < bytes) {
-            return -1;
-        }
+        // Same as ReadData but without copying
+        int currentWrite = mWritePos.load(std::memory_order_acquire);
+        int currentRead = mReadPos.load(std::memory_order_relaxed);
         
-        if (snapshot.readPos < 0 || snapshot.readPos >= snapshot.bufSize)
-            return -1;
+        int available = (currentWrite - currentRead + mBufSize) % mBufSize;
+        bytes = std::min(bytes, available);
         
-        int contiguous = std::min(bytes, snapshot.bufSize - snapshot.readPos);
-        std::memcpy(static_cast<uint8_t*>(dst), &mBuffer[snapshot.readPos], contiguous);
-        
-        if (bytes > contiguous) {
-            std::memcpy(&static_cast<uint8_t*>(dst)[contiguous], &mBuffer[0], bytes - contiguous);
+        if (bytes > 0) {
+            int endRead = (currentRead + bytes) % mBufSize;
+            mReadPos.store(endRead, std::memory_order_release);
+            
+            RING_LOG("SkipData: skipped %d bytes, readPos %d->%d", bytes, currentRead, endRead);
         }
         
         return bytes;
     }
     
     inline int Rewind(int bytes) {
-        BufferSnapshot snapshot = GetAtomicSnapshot();
+        if (bytes <= 0) return 0;
         
-        int maxRewind;
-        if (snapshot.saveReadPos != -1) {
-            maxRewind = (snapshot.readPos - snapshot.saveReadPos + snapshot.bufSize) % snapshot.bufSize;
-        } else {
-            int usedSpace = (snapshot.writePos - snapshot.readPos + snapshot.bufSize) % snapshot.bufSize;
-            int totalBufferUsed = snapshot.bufSize - snapshot.freeSpace;
-            maxRewind = totalBufferUsed - usedSpace;
-            if (maxRewind < 0) maxRewind = 0;
+        // Only allow rewind in save mode for safety
+        if (mSaveReadPos == -1) {
+            RING_LOG("Rewind: no save state - cannot rewind");
+            return -1;
         }
+        
+        int currentRead = mReadPos.load(std::memory_order_relaxed);
+        
+        // Calculate how far we can safely rewind
+        int maxRewind = (currentRead - mSaveReadPos + mBufSize) % mBufSize;
         
         if (bytes > maxRewind) {
-            return -maxRewind;
+            RING_LOG("Rewind: requested %d > max %d", bytes, maxRewind);
+            return -1;
         }
         
-        int newReadPos = (snapshot.readPos - bytes + snapshot.bufSize) % snapshot.bufSize;
-        if (newReadPos < 0 || newReadPos >= snapshot.bufSize) {
-            return -maxRewind;
-        }
+        int newRead = (currentRead - bytes + mBufSize) % mBufSize;
+        mReadPos.store(newRead, std::memory_order_release);
         
-        // Update snapshot and write back
-        snapshot.readPos = newReadPos;
-        snapshot.freeSpace += bytes;
-        
-        UpdateAtomicState(snapshot);
-        
-        return bytes;
-    }
-    
-    inline int SkipData(int bytes) {
-        BufferSnapshot snapshot = GetAtomicSnapshot();
-        
-        int usedSpace = snapshot.UsedSpace();
-        if (usedSpace < bytes) {
-            return -1;  // Not enough data to skip
-        }
-        
-        // Calculate new read position (same as ReadData)
-        int newReadPos = (snapshot.readPos + bytes) % snapshot.bufSize;
-        
-        // Update snapshot (same as ReadData but no memcpy)
-        snapshot.readPos = newReadPos;
-        snapshot.freeSpace += bytes;
-        
-        UpdateAtomicState(snapshot);
-        
+        RING_LOG("Rewind: rewound %d bytes, readPos %d->%d", bytes, currentRead, newRead);
         return bytes;
     }
     
     inline int Offset(int delta) {
-        BufferSnapshot snapshot = GetAtomicSnapshot();
+        if (delta == 0) return 0;
         
-        int usedSpace = snapshot.UsedSpace();
+        int currentRead = mReadPos.load(std::memory_order_relaxed);
+        int currentWrite = mWritePos.load(std::memory_order_acquire);
         
-        if (delta >= 0 && delta <= usedSpace) {
-            int newReadPos = (snapshot.readPos + delta) % snapshot.bufSize;
-            if (newReadPos < 0 || newReadPos >= snapshot.bufSize) {
+        int newRead = (currentRead + delta + mBufSize) % mBufSize;
+        
+        // Validate new position doesn't go past write position
+        int available = (currentWrite - currentRead + mBufSize) % mBufSize;
+        
+        if (delta > 0 && delta > available) {
+            RING_LOG("Offset: forward offset %d > available %d", delta, available);
+            return -1;
+        }
+        
+        if (delta < 0) {
+            // For backward offset, check if we have save state
+            if (mSaveReadPos == -1) {
+                RING_LOG("Offset: backward offset requires save state");
                 return -1;
             }
             
-            // Update snapshot
-            snapshot.readPos = newReadPos;
-            snapshot.freeSpace += delta;
-            
-            UpdateAtomicState(snapshot);
-            return 0;
+            int maxBackward = (currentRead - mSaveReadPos + mBufSize) % mBufSize;
+            if (-delta > maxBackward) {
+                RING_LOG("Offset: backward offset %d > max %d", -delta, maxBackward);
+                return -1;
+            }
         }
-        return -2;
+        
+        mReadPos.store(newRead, std::memory_order_release);
+        RING_LOG("Offset: moved %d, readPos %d->%d", delta, currentRead, newRead);
+        return 0;
     }
     
     inline bool CanOffset(int offset) const {
-        const BufferSnapshot snapshot = GetAtomicSnapshot();
+        int currentRead = mReadPos.load(std::memory_order_acquire);
+        int currentWrite = mWritePos.load(std::memory_order_acquire);
         
-        // Check if we can offset by this amount without going past write position
-        int newReadPos = (snapshot.readPos + offset + snapshot.bufSize) % snapshot.bufSize;
-        int distanceToWrite = (snapshot.writePos - newReadPos + snapshot.bufSize) % snapshot.bufSize;
+        if (offset > 0) {
+            int available = (currentWrite - currentRead + mBufSize) % mBufSize;
+            return offset <= available;
+        } else if (offset < 0) {
+            if (mSaveReadPos == -1) return false;
+            int maxBackward = (currentRead - mSaveReadPos + mBufSize) % mBufSize;
+            return (-offset) <= maxBackward;
+        }
         
-        return (offset <= snapshot.UsedSpace()) && (distanceToWrite >= 0);
+        return true; // offset == 0
     }
+    
+    // ===== DEBUGGING & VALIDATION =====
     
     inline void LogSaveRestoreBalance() const {
         RING_LOG("Save/Restore balance: SaveRead=%d, RestoreRead=%d, InSaveMode=%s",
-                 mSaveReadCallCount, mRestoreReadCallCount, (mSaveFreeSpace.load() != -1) ? "YES" : "NO");
+                 mSaveReadCallCount, mRestoreReadCallCount,
+                 (mSaveReadPos != -1) ? "YES" : "NO");
     }
     
-    inline void LogBufferState(const char*_Nonnull context = "") const {
-        const BufferSnapshot snapshot = GetAtomicSnapshot();
+    inline void LogBufferState(const char* _Nonnull context = "") const {
+        int currentRead = mReadPos.load(std::memory_order_acquire);
+        int currentWrite = mWritePos.load(std::memory_order_acquire);
+        int used = UsedSpace();
+        int free = FreeSpace();
         
         RING_LOG("Buffer[%s]: size=%d, free=%d, used=%d, read=%d, write=%d, saveMode=%s",
-                 context,
-                 snapshot.bufSize,
-                 snapshot.EffectiveFreeSpace(),
-                 snapshot.UsedSpace(),
-                 snapshot.readPos,
-                 snapshot.writePos,
-                 snapshot.InSaveMode() ? "YES" : "NO");
+                 context, mBufSize, free, used, currentRead, currentWrite,
+                 (mSaveReadPos != -1) ? "YES" : "NO");
     }
     
-    
-    inline void CheckSaveRestoreUsage() {
+    inline void CheckSaveRestoreUsage() const {
         RING_LOG("Save/Restore Usage Analysis:");
         RING_LOG("   SaveRead calls: %d", mSaveReadCallCount);
         RING_LOG("   RestoreRead calls: %d", mRestoreReadCallCount);
-        RING_LOG("   Currently in save mode: %s", (mSaveFreeSpace.load() != -1) ? "YES" : "NO");
+        RING_LOG("   Currently in save mode: %s", (mSaveReadPos != -1) ? "YES" : "NO");
         
         if (mSaveReadCallCount > mRestoreReadCallCount + 1) {
-            RING_LOG("SaveRead/RestoreRead imbalance detected!");
-            RING_LOG("   This suggests a logic error in peek/read mode switching");
+            RING_LOG("⚠️ SaveRead/RestoreRead imbalance detected!");
         }
     }
     
     inline void DumpBufferState(const char* context) const {
-        const BufferSnapshot snapshot = GetAtomicSnapshot();
+        int currentRead = mReadPos.load(std::memory_order_acquire);
+        int currentWrite = mWritePos.load(std::memory_order_acquire);
         
         RING_LOG("BUFFER DUMP [%s]:", context);
-        RING_LOG("  bufSize: %d", snapshot.bufSize);
-        RING_LOG("  freeSpace: %d", snapshot.freeSpace);
-        RING_LOG("  saveFreeSpace: %d", snapshot.saveFreeSpace);
-        RING_LOG("  readPos: %d", snapshot.readPos);
-        RING_LOG("  writePos: %d", snapshot.writePos);
-        RING_LOG("  saveReadPos: %d", snapshot.saveReadPos);
-        RING_LOG("  InSaveMode: %s", snapshot.InSaveMode() ? "YES" : "NO");
-        RING_LOG("  EffectiveFreeSpace: %d", snapshot.EffectiveFreeSpace());
-        RING_LOG("  UsedSpace: %d", snapshot.UsedSpace());
-        RING_LOG("  Buffer health: %s", ValidateSnapshot(snapshot, context) ? "OK" : "BROKEN");
+        RING_LOG("  bufSize: %d", mBufSize);
+        RING_LOG("  readPos: %d", currentRead);
+        RING_LOG("  writePos: %d", currentWrite);
+        RING_LOG("  saveReadPos: %d", mSaveReadPos);
+        RING_LOG("  freeSpace: %d", FreeSpace());
+        RING_LOG("  usedSpace: %d", UsedSpace());
+        RING_LOG("  inSaveMode: %s", (mSaveReadPos != -1) ? "YES" : "NO");
+        RING_LOG("  isValid: %s", ValidateBuffer() ? "YES" : "NO");
     }
     
-protected:
+    inline bool ValidateBuffer() const {
+        int currentRead = mReadPos.load(std::memory_order_acquire);
+        int currentWrite = mWritePos.load(std::memory_order_acquire);
+        
+        // Check positions are within bounds
+        if (currentRead < 0 || currentRead >= mBufSize) {
+            RING_LOG("❌ Invalid readPos: %d", currentRead);
+            return false;
+        }
+        
+        if (currentWrite < 0 || currentWrite >= mBufSize) {
+            RING_LOG("❌ Invalid writePos: %d", currentWrite);
+            return false;
+        }
+        
+        if (mSaveReadPos != -1 && (mSaveReadPos < 0 || mSaveReadPos >= mBufSize)) {
+            RING_LOG("❌ Invalid saveReadPos: %d", mSaveReadPos);
+            return false;
+        }
+        
+        // Check space calculations are consistent
+        int used = UsedSpace();
+        int free = FreeSpace();
+        
+        if (used + free + 1 != mBufSize) { // +1 for the reserved slot
+            RING_LOG("❌ Space calculation error: used=%d + free=%d + 1 != size=%d", used, free, mBufSize);
+            return false;
+        }
+        
+        return true;
+    }
     
     // Disable copy operations
     RingBuffer(const RingBuffer&) = delete;
@@ -418,3 +434,4 @@ protected:
     RingBuffer(RingBuffer&& other) noexcept = delete;
     RingBuffer& operator=(RingBuffer&& other) noexcept = delete;
 };
+

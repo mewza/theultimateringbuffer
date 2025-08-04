@@ -22,32 +22,6 @@
 } while (0)
 #endif
 
-/*
-    The Ultimate Ring Buffer - It only took 25 years to write it.
-    �1999-2025 SUBBAND, Inc. & Dmitry Boldyrev
-    
-    Description:    Ring Buffer with std::atomic Synchronization
-    Updated:        Aug 3, 2025
-*/
-
-#pragma once
-
-#include <algorithm>
-#include <cstring>
-#include <atomic>
-#include <chrono>
-
-// #define DEBUG_RING
-
-#ifdef DEBUG_RING
-#define RING_LOG(fmt, ...) do { \
-    LOG(fmt, ##__VA_ARGS__); \
-} while (0)
-#else
-#define RING_LOG(fmt, ...) do { \
-} while (0)
-#endif
-
 class RingBuffer {
 private:
     std::atomic<int> mReadPos{0};
